@@ -1,34 +1,28 @@
 # TinLynk Architecture
 
-Components, capabilities, APIs, and relationships between Chat, Code, Connect, Protocol, MCP Server and SDK, and .github.
+Components, capabilities, APIs, and relationships between Chat, Connect, Protocol, SDK, and .github.
 
 > Canonical names & IDs
 > - Platform: TinLynk
-> - Apps: TinLynk Chat (“Chat”), TinLynk Code (“Code”), TinLynk Connect (“Connect”), TinLynk MCP Server (“MCP Server”)
+> - Apps: TinLynk Chat (“Chat”), TinLynk Connect (“Connect”)
 > - Packages: @tinlynk/protocol, @tinlynk/sdk
-> - Repos (GitHub org: tinlynk): chat, code, connect, mcp-server, sdk, protocol, .github
-> - Docker: ghcr.io/tinlynk/mcp-server
-> - Service IDs: dev.tinlynk.connect, dev.tinlynk.mcp
+> - Repos (GitHub org: tinlynk): chat, connect, sdk, protocol, .github
+> - Service IDs: dev.tinlynk.connect
 
 ## 1) High-level: Agent-centric view
 
 User
 │
 ▼
-TinLynk Chat (app) ──────────────┐
-TinLynk Code (VS Code ext) ────┐ │
-│ │   (uses @tinlynk/sdk; typed by @tinlynk/protocol)
-▼ ▼
+TinLynk Chat (app)
+│   (uses @tinlynk/sdk; typed by @tinlynk/protocol)
+▼
 @tinlynk/sdk  ──────────────►  Model Providers (OpenAI/OSS/etc)
 │
-├────────► TinLynk Connect (profiles, routing, secrets, model catalog)
-│
-└────────► TinLynk MCP Server (tools via MCP)
-│
-└──► Tools (filesystem, git, http, cloud APIs, etc.)
+└────────► TinLynk Connect (profiles, routing, secrets, model catalog)
 
-- **The AI Agent** lives inside Chat and Code as a configurable runtime using `@tinlynk/sdk`.
-- The Agent routes model calls via **Connect** (discovery, profiles, secrets, routing) and executes **tools** via **MCP Server**.
+- **The AI Agent** lives inside Chat as a configurable runtime using `@tinlynk/sdk`.
+- The Agent routes model calls via **Connect** (discovery, profiles, secrets, routing) and coordinates tools through SDK-defined contracts.
 - Types and schemas are defined in **@tinlynk/protocol**.
 - CI/CD, versioning, and policies are orchestrated by workflows in **.github**.
 
@@ -36,19 +30,16 @@ TinLynk Code (VS Code ext) ────┐ │
 
 | Component | Primary Function | Key Capabilities | Depends On |
 |---|---|---|---|
-| **Chat** (`chat`) | Desktop/web app for conversations | Sessions, history, attachments, prompt presets, agent configs, multi-model, tool opt-in | `@tinlynk/sdk`, `@tinlynk/protocol`, Connect, MCP Server |
-| **Code** (`code`) | VS Code extension for in-editor AI | Inline/completions, chat-in-editor, code actions, tool calls gated by workspace perms | `@tinlynk/sdk`, `@tinlynk/protocol`, Connect, MCP Server |
+| **Chat** (`chat`) | Desktop/web app for conversations | Sessions, history, attachments, prompt presets, agent configs, multi-model, tool opt-in | `@tinlynk/sdk`, `@tinlynk/protocol`, Connect |
 | **Connect** (`connect`) | Local daemon + CLI + service registry | Model discovery, profiles, routing, token/secret vault, policy enforcement | `@tinlynk/sdk` (optional), `@tinlynk/protocol` |
-| **MCP Server** (`mcp-server`) | Tool host implementing MCP | Tool registry, auth to tools, execution sandbox, streaming tool I/O | `@tinlynk/protocol` |
-| **@tinlynk/sdk** (`sdk`) | Client library for apps/CLIs | Model client, tool client (MCP), auth, transports, router, retries, streaming | `@tinlynk/protocol` |
+| **@tinlynk/sdk** (`sdk`) | Client library for apps/CLIs | Model client, tool client, auth, transports, router, retries, streaming | `@tinlynk/protocol` |
 | **@tinlynk/protocol** (`protocol`) | Types + JSON Schemas | Messages, tool contracts, events, error types, versioning (semver) | none |
 | **.github** (`.github`) | Reusable GitHub Actions | Build, test, lint, release, SBoM, provenance, publish (NPM/Docker), PR gates | n/a |
 
 **Dependency rules (enforced):**
 - `protocol → none`
 - `sdk → protocol`
-- `mcp-server → protocol` (never `sdk`)
-- Apps/CLIs (`chat`, `code`, `connect`) → `sdk`
+- Apps/CLIs (`chat`, `connect`) → `sdk`
 - Shared workflows live in `.github`
 
 ## 3) Protocol: `@tinlynk/protocol`
@@ -127,7 +118,7 @@ const router = new Router({
 
 const model = new ModelClient({ router });
 const tools = new ToolClient({
-  endpoint: "http://127.0.0.1:8765", // MCP Server (example)
+  invoke: async (call) => ({ callId: call.callId, result: { ok: true } }),
 });
 
 const req: ChatRequest = {
@@ -145,47 +136,7 @@ for await (const evt of model.stream(req)) {
 }
 ```
 
-## 5) MCP Server: mcp-server
-
-Implements the Model Context Protocol server to host and execute tools.
-
-Capabilities
-- Tool registry: static, dynamic, or plugin-based.
-- AuthN/Z to external systems (git, filesystem, cloud).
-- Sandboxed execution and rate/usage limits.
-- Streaming results for long-running actions.
-- Deployable as Docker: ghcr.io/tinlynk/mcp-server.
-
-MCP Tool Example
-
-```json
-{
-  "name": "fs.readFile",
-  "title": "Read a text file",
-  "description": "Reads UTF-8 text from a path within the workspace.",
-  "inputSchema": {
-    "type": "object",
-    "required": ["path"],
-    "properties": {
-      "path": { "type": "string", "pattern": "^workspace:/.+" }
-    }
-  },
-  "outputSchema": {
-    "type": "object",
-    "properties": {
-      "content": { "type": "string" }
-    }
-  }
-}
-```
-
-Tool execution result (streamed):
-
-```json
-{ "type": "tool_result", "callId": "call-123", "data": { "content": "..." } }
-```
-
-## 6) Connect: connect
+## 5) Connect: connect
 
 Local daemon (and CLI tlconnect) that centralizes model profiles, secrets, routing.
 
@@ -222,7 +173,7 @@ Example profile JSON:
 }
 ```
 
-## 7) Chat: chat
+## 6) Chat: chat
 
 End-user app for conversations and agent management.
 
@@ -251,33 +202,7 @@ memory:
   scope: "per-agent"
 ```
 
-## 8) Code: code
-
-VS Code extension that embeds the Agent in the editor.
-
-Capabilities
-- Inline completions and chat side panel.
-- Code actions: refactor, test scaffolding, docstrings.
-- Tooling via MCP with workspace permissions and audit trail.
-- Uses Connect for profiles, secrets, and routing.
-
-Extension Commands (examples)
-- tinlynk.openPanel
-- tinlynk.runSelectedCodeWithAgent
-- tinlynk.toggleTool <toolName>
-- tinlynk.selectProfile
-
-Workspace policy (JSON):
-
-```json
-{
-  "allowTools": ["fs.readFile", "git.status", "http.fetch"],
-  "denyPaths": ["workspace:/secrets/", "workspace:/node_modules/"],
-  "askOnFirstUse": true
-}
-```
-
-## 9) .github: reusable CI/CD
+## 7) .github: reusable CI/CD
 
 Centralized GitHub Actions and policies.
 
@@ -300,32 +225,32 @@ jobs:
       node-version: '22'
 ```
 
-## 10) End-to-end Agent flow
+## 8) End-to-end Agent flow
 
-1.	User input arrives in Chat or Code.
+1.	User input arrives in Chat.
 2.	App constructs a ChatRequest (typed by @tinlynk/protocol).
 3.	SDK Router queries Connect for profile-based routing.
 4.	Model call begins; streaming tokens flow back to app via SDK.
 5.	If the assistant requires a tool, it emits a ToolCall (per Protocol).
-6.	App or SDK forwards that to MCP Server; tool executes securely.
+6.	App or SDK invokes the configured tool handler.
 7.	Tool result streams back; SDK resumes the model run with tool output.
 8.	Final response is rendered; logs/telemetry recorded.
 
-## 11) Security & Policy
+## 9) Security & Policy
 
 - Connect holds provider secrets and enforces routing/policies.
-- MCP Server sandboxes tools; per-tool scopes and rate limits.
-- Code prompts for workspace permission before sensitive tools.
 - Chat exposes tool toggles and per-session consent.
 - SDK adds request IDs, redacts secrets, and supports signed attestations.
 
-## 12) Minimal Agent bootstrap (Node)
+## 10) Minimal Agent bootstrap (Node)
 
 ```ts
 import { Agent } from "@tinlynk/sdk/agent";
 import { ToolClient, ModelClient, Router } from "@tinlynk/sdk";
 
-const tools = new ToolClient({ endpoint: "http://127.0.0.1:8765" }); // MCP Server
+const tools = new ToolClient({
+  invoke: async (call) => ({ callId: call.callId, result: { ok: true } })
+});
 const router = new Router({ connectUrl: "http://127.0.0.1:8730" });  // Connect
 const model = new ModelClient({ router });
 
@@ -343,19 +268,16 @@ const out = await agent.run({
 console.log(out.text);
 ```
 
-## 13) Repository layout recap
+## 11) Repository layout recap
 
 - protocol → @tinlynk/protocol (types/schemas; no runtime deps)
 - sdk → @tinlynk/sdk (clients/auth/transport/router; depends on protocol)
-- mcp-server → “TinLynk MCP Server” (Docker; depends on protocol)
 - connect → “TinLynk Connect” (daemon/CLI; depends on sdk)
 - chat → “TinLynk Chat” (app; depends on sdk)
-- code → “TinLynk Code” (VS Code ext; depends on sdk)
 - .github → shared workflows and policy
 
-## 14) Contract compatibility and versioning
+## 12) Contract compatibility and versioning
 
 - Protocol is semver: breaking changes increment major.
 - SDK pins a protocol range, apps pin an SDK range.
-- MCP Server validates tool manifests against the current protocol.
 - Connect exposes its own API version and declares supported protocol ranges.
