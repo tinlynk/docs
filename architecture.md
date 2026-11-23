@@ -1,6 +1,6 @@
 # TinLynk Architecture
 
-Components, capabilities, APIs, and relationships between Chat, Connect, Protocol, SDK, and .github.
+Components, responsibilities, protocol, and relationships between Chat, Connect, Protocol, SDK, and .github.
 
 > Canonical names & IDs
 > - Platform: TinLynk
@@ -9,275 +9,206 @@ Components, capabilities, APIs, and relationships between Chat, Connect, Protoco
 > - Repos (GitHub org: tinlynk): chat, connect, sdk, protocol, .github
 > - Service IDs: dev.tinlynk.connect
 
-## 1) High-level: Agent-centric view
+This document distinguishes the **target architecture** from **verified implementation**. Mocked tests cover local mappings; live provider and harness compatibility remains unverified.
 
+## 1) High-level flow
+
+```text
 User
-│
-▼
-TinLynk Chat (app)
-│   (uses @tinlynk/sdk; typed by @tinlynk/protocol)
-▼
-@tinlynk/sdk  ──────────────►  Model Providers (OpenAI/OSS/etc)
-│
-└────────► TinLynk Connect (profiles, routing, secrets, model catalog)
+  │
+  ▼
+TinLynk Chat ── @tinlynk/sdk ── TinLynk Connect ── provider adapter ── provider
+                     │                 │
+                     └── @tinlynk/protocol contracts ──┘
+```
 
-- **The AI Agent** lives inside Chat as a configurable runtime using `@tinlynk/sdk`.
-- The Agent routes model calls via **Connect** (discovery, profiles, secrets, routing) and coordinates tools through SDK-defined contracts.
-- Types and schemas are defined in **@tinlynk/protocol**.
-- CI/CD, versioning, and policies are orchestrated by workflows in **.github**.
+- **Chat** is the end-user app and agent runtime.
+- **Connect is the required gateway** for app model traffic. The SDK sends requests to Connect; it does not call provider APIs directly.
+- **Connect** owns provider credentials, upstream calls, and provider-specific adapters/mappings.
+- **Protocol** defines the TinLynk app-facing contract. The initial target is a text-and-tools subset, with room to expand.
+- **.github** provides shared CI/CD workflows and policies.
 
-## 2) Roles & Capabilities (at a glance)
+## 2) Roles and dependency rules
 
-| Component | Primary Function | Key Capabilities | Depends On |
-|---|---|---|---|
-| **Chat** (`chat`) | Desktop/web app for conversations | Sessions, history, attachments, prompt presets, agent configs, multi-model, tool opt-in | `@tinlynk/sdk`, `@tinlynk/protocol`, Connect |
-| **Connect** (`connect`) | Local daemon + CLI + service registry | Model discovery, profiles, routing, token/secret vault, policy enforcement | `@tinlynk/sdk` (optional), `@tinlynk/protocol` |
-| **@tinlynk/sdk** (`sdk`) | Client library for apps/CLIs | Model client, tool client, auth, transports, router, retries, streaming | `@tinlynk/protocol` |
-| **@tinlynk/protocol** (`protocol`) | Types + JSON Schemas | Messages, tool contracts, events, error types, versioning (semver) | none |
-| **.github** (`.github`) | Reusable GitHub Actions | Build, test, lint, release, SBoM, provenance, publish (NPM/Docker), PR gates | n/a |
+| Component | Responsibility | Target dependency |
+|---|---|---|
+| **Chat** (`chat`) | Conversations, history, agent configuration, tool consent, and rendering | `@tinlynk/sdk`, `@tinlynk/protocol`; model traffic through Connect |
+| **Connect** (`connect`) | Required local gateway, provider credentials, model configuration, and provider adapter ownership | `@tinlynk/protocol`; provider integrations remain behind Connect |
+| **@tinlynk/sdk** (`sdk`) | Typed app client, Connect transport, and tool invocation support | `@tinlynk/protocol` |
+| **@tinlynk/protocol** (`protocol`) | Versioned app-facing types and wire contracts | none |
+| **.github** (`.github`) | Shared build, test, lint, release, and security workflows | n/a |
 
-**Dependency rules (enforced):**
+Target dependency rules:
 - `protocol → none`
 - `sdk → protocol`
-- Apps/CLIs (`chat`, `connect`) → `sdk`
-- Shared workflows live in `.github`
+- `connect → protocol` (not SDK; provider integration belongs in Connect)
+- App clients such as Chat → SDK and protocol; all app model requests go via Connect.
 
-## 3) Protocol: `@tinlynk/protocol`
-Source of truth for types, JSON Schemas, and wire contracts.
+These are target boundaries. Current package dependencies and behavior are summarized in [Implementation status](#8-implementation-status).
 
-### Capabilities
-- Versioned schemas (semver); `x-protocol-version` header on HTTP/WebSocket.
-- Message contracts for: chat, tool calls, function arguments, events, errors.
-- MCP-compatible tool descriptors.
+## 3) TinLynk protocol: `@tinlynk/protocol`
 
-### Example Types (TypeScript)
+The protocol is the canonical contract between apps, SDK, and Connect. It is not a provider API shape. The initial target covers text and application-executed tools only; multimodal content is explicitly outside the initial contract.
+
+### Protocol message shape
+
+Option B uses **ordered typed content parts**. The protocol package exports the following contract:
+
 ```ts
-// @tinlynk/protocol
+type Role = "system" | "user" | "assistant" | "tool";
 
-export type Role = "system" | "user" | "assistant" | "tool";
+type ContentPart =
+  | { type: "text"; text: string }
+  | {
+      type: "tool_call";
+      callId: string;
+      name: string;
+      arguments: unknown;
+    }
+  | {
+      type: "tool_result";
+      callId: string;
+      result: unknown;
+      isError?: boolean;
+    };
 
-export interface Message {
+interface Message {
   id: string;
   role: Role;
-  content: string;            // plain or markdown
-  toolCall?: ToolCall;        // when assistant invokes a tool
-  timestamp: string;          // ISO
+  content: ContentPart[];
+  timestamp: string;
   metadata?: Record<string, unknown>;
 }
 
-export interface ToolDescriptor {
-  name: string;               // e.g. "fs.readFile"
-  title?: string;
-  description?: string;
-  inputSchema: JSONSchema;    // strict input contract
-  outputSchema?: JSONSchema;
-}
-
-export interface ToolCall {
-  name: string;               // must match ToolDescriptor.name
-  arguments: unknown;         // validated against inputSchema
-  callId: string;             // for streaming/result correlation
-}
-
-export interface ChatRequest {
-  model: string;
-  messages: Message[];
-  tools?: ToolDescriptor[];
-  stream?: boolean;
-  temperature?: number;
-  metadata?: Record<string, unknown>;
-}
-
-export interface ChatStreamEvent {
-  type: "token" | "tool_call" | "tool_result" | "done" | "error";
-  data: unknown;
-}
-```
-
-## 4) SDK: @tinlynk/sdk
-
-A lightweight, typed client for models, tools (MCP), and routing.
-
-Capabilities
-- Transports: HTTP(S), WebSocket, process/IPC, and Connect bridge.
-- ModelClient: chat/completions embedding; SSE/WebSocket streaming.
-- ToolClient: MCP handshake, list, call, streaming tool I/O.
-- Router: profile-aware model selection and failover.
-- Auth: bearer tokens, local Connect session, provider keys.
-- Observability: structured logs, hooks, request IDs.
-
-Minimal Usage
-
-```ts
-import { ModelClient, ToolClient, Router, type ChatRequest } from "@tinlynk/sdk";
-
-const router = new Router({
-  // Delegates to Connect if available, else direct
-  strategy: "connect-first",
-});
-
-const model = new ModelClient({ router });
-const tools = new ToolClient({
-  invoke: async (call) => ({ callId: call.callId, result: { ok: true } }),
-});
-
-const req: ChatRequest = {
-  model: "openai:gpt-4.1-mini",
-  messages: [{ id: "m1", role: "user", content: "Summarize repo structure." , timestamp: new Date().toISOString()}],
-  tools: await tools.list(), // pull live tool descriptors
-  stream: true,
-};
-
-for await (const evt of model.stream(req)) {
-  if (evt.type === "tool_call") {
-    const result = await tools.call(evt.data as any);
-    await model.sendToolResult(req, result); // continue the run
-  }
-}
-```
-
-## 5) Connect: connect
-
-Local daemon (and CLI tlconnect) that centralizes model profiles, secrets, routing.
-
-Capabilities
-- Profiles: named sets of provider keys, defaults, rate caps.
-- Model catalog: discovered from providers and local backends.
-- Routing: choose best model by policy (cost, latency, size, allowlist).
-- Token/secret vault: per-profile secure storage.
-- HTTP API for apps/SDK; service id: dev.tinlynk.connect.
-
-Example API (HTTP; local only by default)
-- GET /v1/models → list known models with metadata.
-- GET /v1/profiles → list profiles.
-- POST /v1/route → choose target { model, transport } for a given request.
-- POST /v1/secrets/put → store provider key (scoped).
-- POST /v1/policy/estimate → tokens/cost estimate.
-
-Example profile JSON:
-
-```json
-{
-  "name": "dev",
-  "defaults": { "model": "openai:gpt-4.1-mini" },
-  "providers": {
-    "openai": { "apiKeyRef": "secret:openai" },
-    "ollama": { "endpoint": "http://localhost:11434" }
+const messages: Message[] = [
+  {
+    id: "a1",
+    role: "assistant",
+    content: [
+      { type: "text", text: "I'll check that." },
+      {
+        type: "tool_call",
+        callId: "call-1",
+        name: "fs.readFile",
+        arguments: { path: "README.md" },
+      },
+    ],
+    timestamp: "2026-11-23T12:00:00Z",
   },
-  "routing": {
-    "rules": [
-      { "if": { "maxInputTokens": 8000 }, "use": "openai:gpt-4.1-mini" },
-      { "if": { "offline": true }, "use": "ollama:llama3.1:8b" }
-    ]
-  }
-}
+  {
+    id: "t1",
+    role: "tool",
+    content: [
+      { type: "tool_result", callId: "call-1", result: { text: "..." } },
+    ],
+    timestamp: "2026-11-23T12:00:01Z",
+  },
+  {
+    id: "a2",
+    role: "assistant",
+    content: [{ type: "text", text: "Here is the summary." }],
+    timestamp: "2026-11-23T12:00:02Z",
+  },
+];
 ```
 
-## 6) Chat: chat
+Part ordering preserves text and multiple tool interactions within messages; `callId` correlates calls and results. Tool descriptors and request/event contracts also belong in the protocol.
 
-End-user app for conversations and agent management.
+Adding content types in the future requires explicit protocol versioning and rules for unknown parts. It does not imply support for images, audio, video, or other multimodal data in the initial contract. Unsupported content or provider-specific continuation state must not be silently discarded.
 
-Capabilities
-- Sessions, message search, attachments, prompt libraries.
-- Agent configs (system prompts, tools on/off, profile, safety).
-- Multi-provider model selection via Connect.
-- Tool consent UI (per tool or per session).
-- Export/import (JSONL), offline fallback to local models.
+## 4) SDK: `@tinlynk/sdk`
 
-Agent Config (YAML)
+The SDK is the app-facing client for TinLynk contracts. Its target model transport sends requests to Connect and receives normalized responses/events. It must not expose direct provider calls as an app model path or require provider credentials in apps.
 
-```yaml
-name: "TinLynk Default Agent"
-profile: "dev"
-model: "openai:gpt-4.1-mini"
-tools:
-  - "fs.readFile"
-  - "git.status"
-  - "http.fetch"
-guardrails:
-  max_tokens: 2000
-  deny_tools_without_consent: true
-memory:
-  enabled: true
-  scope: "per-agent"
-```
+Tool handlers may be local to the app/runtime: the app applies its consent policy, executes requested tools, and sends correlated results back through the SDK/Connect flow. The SDK implements a repeated tool-call loop: it executes allow-listed tool calls, appends correlated results, and requests the next model turn.
+
+## 5) Connect: `connect`
+
+Connect is the required local gateway for app model traffic (service ID `dev.tinlynk.connect`). It owns provider credentials and upstream provider communication. Provider-specific request, response, and streaming differences are handled behind Connect's adapter boundary; apps consume the TinLynk protocol instead.
+
+Connect also owns configured model aliases and provider settings. Credentials stay in Connect and are not part of Chat or SDK configuration.
+
+### OpenAI-compatible compatibility surface
+
+Connect exposes `/v1/chat` as the **canonical TinLynk protocol** and keeps `/v1/chat/completions` as an OpenAI-compatible interoperability facade. The two wire formats remain separate.
+
+### External harness compatibility (target)
+
+Connect is the shared gateway for external harnesses too: model aliases, provider routing, and credential management live in Connect. Harnesses use their native wire format through standard facades, not the TinLynk SDK protocol:
+
+| Standard facade | Wire format | Status |
+|---|---|---|
+| `/v1/chat/completions` | OpenAI Chat Completions | Implemented for compatible providers |
+| `/v1/responses` | OpenAI Responses | Implemented as OpenAI-only same-format forwarding |
+| `/v1/messages` | Anthropic Messages | Implemented as Anthropic-only same-format forwarding |
+
+Target harnesses and their expected formats:
+
+- **Copilot CLI** supports custom OpenAI-compatible providers, including the Responses wire option, and Anthropic providers using Messages.
+- **Copilot in VS Code** is a separate target: Copilot Chat has a built-in custom-endpoint provider for Chat Completions, Responses, or Messages; an extension is optional.
+- **Codex CLI** requires the Responses facade.
+- **Claude Code** uses the Messages facade and may route only to Claude-compatible upstreams.
+
+These facades are implemented with provider-type checks and preserve the matching provider wire format. The canonical SDK endpoint is `POST /v1/chat`, versioned with `X-TinLynk-Protocol-Version`; OpenAI Responses and Anthropic Messages are also used as native upstream APIs by the canonical adapter. Live Copilot, Codex CLI, and Claude Code compatibility is not verified.
+
+Adapters must preserve each wire format's tool and streaming semantics. If a requested feature cannot be represented or supported, the adapter should return an explicit error rather than silently dropping it. Use the standard facade paths above; no `/v1/tinlynk` namespace is planned for external harness compatibility.
+
+## 6) Chat: `chat`
+
+Chat is the end-user app for conversations and agent management. Its product scope includes sessions/history, prompt and agent configuration, model selection through Connect, tool opt-in/consent, and conversation rendering. Chat uses the SDK and TinLynk protocol; it does not call providers directly or hold provider credentials.
 
 ## 7) .github: reusable CI/CD
 
 Centralized GitHub Actions and policies.
 
-Workflows
-- build-node.yml: matrix builds for Node, caches, tsc, tests.
-- release-npm.yml: version bump, changelog, provenance/SBoM, publish to @tinlynk/*.
-- release-docker.yml: build and push ghcr.io/tinlynk/*.
-- lint.yml: ESLint, TypeScript, markdownlint, license headers.
-- security.yml: CodeQL/SAST, dependency review, secret scanning.
+Workflows may include build/test, lint, release, artifact provenance, and security checks. Shared workflows are consumed by package repositories; their exact availability is maintained in the `.github` repository.
 
-Usage in a repo (.github/workflows/ci.yml)
+## 8) Implementation status
 
-```yaml
-name: CI
-on: [push, pull_request]
-jobs:
-  build:
-    uses: tinlynk/.github/.github/workflows/build-node.yml@main
-    with:
-      node-version: '22'
-```
+The current packages are a baseline, not a production-complete gateway-backed agent/provider stack.
 
-## 8) End-to-end Agent flow
+- **Protocol:** The package exports ordered `text`, `tool_call`, and `tool_result` parts; JSON Schemas reject unknown part variants. Focused schema and TypeScript tests pass. The package remains unpublished, so no external legacy migration is required.
+- **SDK:** `ConnectTransport` calls `/v1/chat`, sends and checks the protocol-version header, and parses non-stream messages and SSE events. `ModelClient` requires a transport. The SDK also retains an OpenAI-compatible Chat Completions adapter with tool mapping and SSE deltas, and `Agent` runs repeated allow-listed tool calls with correlated results. SDK build and focused tests pass.
+- **Connect:** `/v1/chat` validates protocol version and supported content parts, maps canonical requests to OpenAI Responses, Anthropic Messages, or Chat Completions, and returns a canonical assistant message or event stream. Standard `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` facades preserve the matching provider format; model routes include OpenAI-shaped `/v1/models` and TinLynk `/v1/catalog/models`. Connect build and server integration tests pass with loopback access; live API and harness compatibility is unverified.
+- **Security and operations:** Connect binds only to loopback and requires a named client token that can be revoked independently. Provider secrets are managed with the CLI and an OS credential store. Upstream calls have a total deadline and retry explicit rate-limit responses only before returning a response; cancellations propagate to upstream. See the Connect README for platform support and migration requirements.
 
-1.	User input arrives in Chat.
-2.	App constructs a ChatRequest (typed by @tinlynk/protocol).
-3.	SDK Router queries Connect for profile-based routing.
-4.	Model call begins; streaming tokens flow back to app via SDK.
-5.	If the assistant requires a tool, it emits a ToolCall (per Protocol).
-6.	App or SDK invokes the configured tool handler.
-7.	Tool result streams back; SDK resumes the model run with tool output.
-8.	Final response is rendered; logs/telemetry recorded.
+The canonical gateway, ordered typed-parts contract, provider mappings, and SDK-driven tool loop are implemented. Production hardening and live harness validation remain outstanding.
 
-## 9) Security & Policy
+## 9) End-to-end target flow
 
-- Connect holds provider secrets and enforces routing/policies.
-- Chat exposes tool toggles and per-session consent.
-- SDK adds request IDs, redacts secrets, and supports signed attestations.
+1. User input arrives in Chat, which constructs protocol messages with ordered content parts.
+2. The SDK sends the request to Connect using the configured model alias; it never sends the app request directly to a provider.
+3. Connect resolves the alias, obtains credentials from its own configuration/secret handling, and routes through its provider adapter.
+4. Connect returns the TinLynk response or stream through the SDK to Chat.
+5. If the assistant requests tools, Chat/runtime applies consent and executes the requested tool.
+6. The tool result is correlated by `callId` and submitted in a subsequent request through the SDK and Connect.
+7. Chat renders the final response.
 
-## 10) Minimal Agent bootstrap (Node)
+The local mocked flow is implemented. No live provider calls or harness runs have validated end-to-end behavior.
 
-```ts
-import { Agent } from "@tinlynk/sdk/agent";
-import { ToolClient, ModelClient, Router } from "@tinlynk/sdk";
+## 10) Security and policy
 
-const tools = new ToolClient({
-  invoke: async (call) => ({ callId: call.callId, result: { ok: true } })
-});
-const router = new Router({ connectUrl: "http://127.0.0.1:8730" });  // Connect
-const model = new ModelClient({ router });
-
-const agent = new Agent({
-  model,
-  tools,
-  policy: { allowTools: ["fs.readFile", "http.fetch"] }
-});
-
-const out = await agent.run({
-  model: "openai:gpt-4.1-mini",
-  messages: [{ id:"u1", role:"user", content:"Read README.md and summarize.", timestamp:new Date().toISOString() }]
-});
-
-console.log(out.text);
-```
+- Connect is responsible for provider credentials; apps and SDK clients do not store provider keys.
+- Chat/runtime applies tool consent before executing tools.
+- Connect API clients authenticate using a local token; provider keys remain in the credential store or provider environment.
+- Canonical request and message metadata are app-local and are not forwarded to providers. Provider-native facade payloads are passed through as native wire formats.
+- Live harness compatibility and security validation remain outstanding; do not treat local access controls as a defense against a compromised user account.
 
 ## 11) Repository layout recap
 
-- protocol → @tinlynk/protocol (types/schemas; no runtime deps)
-- sdk → @tinlynk/sdk (clients/auth/transport/router; depends on protocol)
-- connect → “TinLynk Connect” (daemon/CLI; depends on sdk)
-- chat → “TinLynk Chat” (app; depends on sdk)
-- .github → shared workflows and policy
+- `protocol` → `@tinlynk/protocol` (types/schemas; no runtime dependencies)
+- `sdk` → `@tinlynk/sdk` (app clients/transports; depends on protocol)
+- `connect` → TinLynk Connect (gateway, CLI, credentials, provider adapters)
+- `chat` → TinLynk Chat (app; uses SDK/protocol and reaches providers through Connect)
+- `.github` → shared workflows and policy
 
 ## 12) Contract compatibility and versioning
 
-- Protocol is semver: breaking changes increment major.
-- SDK pins a protocol range, apps pin an SDK range.
-- Connect exposes its own API version and declares supported protocol ranges.
+- Protocol changes follow semver; breaking changes increment the major version.
+- The SDK pins a compatible protocol range, and apps pin a compatible SDK range.
+- Connect currently requires an exact X-TinLynk-Protocol-Version match on the canonical route.
+- Future content-part variants require explicit versioning; unknown parts and unsupported canonical fields are rejected.
+
+## Validation
+
+Protocol and SDK build/tests pass. Connect tests cover authorization, deadlines, retries, cancellation, metadata isolation, local IPC, and loopback HTTP integration. No live provider or harness compatibility tests were run.
